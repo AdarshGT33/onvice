@@ -85,11 +85,35 @@ func (h *Handler) TakingInputofRepoandProjectName(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"message":    "Repository input accepted",
-		"name":       input.ProjectName,
-		"github_url": input.GithubURL,
+	app, deployment, err := h.store.CreateAppWithDeployment(
+		c.Request.Context(),
+		input.ProjectName,
+		input.GithubURL,
+	)
+	if err != nil {
+		if errors.Is(err, store.ErrNameTaken) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "A project with this name already exists",
+			})
+			return
+		}
+
+		_ = c.Error(err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to create deployment",
+		})
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"message":       "Deployment queued",
+		"app_id":        app.ID,
+		"name":          app.Name,
+		"github_url":    app.RepoURL,
+		"deployment_id": deployment.ID,
+		"status":        deployment.Status,
 	})
+
 }
 
 func ValidateGitHubURL(rawURL string) error {

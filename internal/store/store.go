@@ -22,7 +22,7 @@ func New(pool *pgxpool.Pool) *Store {
 }
 
 type App struct {
-	ID        int64     `json:"id"`
+	ID        string    `json:"id"`
 	Name      string    `json:"name"`
 	RepoURL   string    `json:"repo_url"`
 	CreatedAt time.Time `json:"created_at"`
@@ -30,8 +30,8 @@ type App struct {
 }
 
 type Deployment struct {
-	ID        int64     `json:"id"`
-	AppID     int64     `json:"app_id"`
+	ID        string    `json:"id"`
+	AppID     string    `json:"app_id"`
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -116,7 +116,7 @@ func (s *Store) CreateAppWithDeployment(
 // GetDeploymentByID retrieves a deployment by its ID.
 func (s *Store) GetDeploymentByID(
 	ctx context.Context,
-	id int64,
+	id string,
 ) (Deployment, error) {
 	var deployment Deployment
 
