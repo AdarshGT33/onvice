@@ -65,6 +65,7 @@ func run() error {
 	r := gin.Default()
 	v1 := r.Group("/api/v1")
 	v1.POST("/projects", h.TakingInputofRepoandProjectName)
+	v1.GET("/deployments/:id", h.GetDeployment)
 
 	server := &http.Server{
 		Addr:    ":8080",

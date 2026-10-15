@@ -14,6 +14,8 @@ import (
 
 	"github.com/AdarshGT33/onvice/internal/store"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 type InputType struct {
@@ -114,6 +116,37 @@ func (h *Handler) TakingInputofRepoandProjectName(c *gin.Context) {
 		"status":        deployment.Status,
 	})
 
+}
+
+func (h *Handler) GetDeployment(c *gin.Context) {
+	id := c.Param("id")
+
+	if _, err := uuid.Parse(id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid deployment ID",
+		})
+	}
+
+	deployment, err := h.store.GetDeploymentByID(
+		c.Request.Context(),
+		id,
+	)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "Deployment not found",
+			})
+			return
+		}
+
+		_ = c.Error(err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to retrieve deployment",
+		})
+	}
+
+	c.JSON(http.StatusOK, deployment)
 }
 
 func ValidateGitHubURL(rawURL string) error {
