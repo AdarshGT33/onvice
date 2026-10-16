@@ -37,6 +37,14 @@ type Deployment struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+type Job struct {
+	ID           string `json:"id"`
+	Kind         string `json:"kind"`
+	DeploymentID string `json:"deployment_id"`
+	Attempts     int    `json:"attempts"`
+	MaxAttempts  int    `json:"max_attempts"`
+}
+
 // CreateAppWithDeployment atomically creates an app,
 // its initial deployment, and its build job.
 func (s *Store) CreateAppWithDeployment(
@@ -142,4 +150,53 @@ func (s *Store) GetDeploymentByID(
 	}
 
 	return deployment, nil
+}
+
+func (s *Store) ClaimNextJob(ctx context.Context) (Job, error) {
+	var job Job
+
+	err := s.pool.QueryRow(ctx, `
+        WITH next_job AS (
+            SELECT id
+            FROM jobs
+            WHERE (
+                status = 'queued'
+                AND run_at <= now()
+            ) OR (
+                status = 'running'
+                AND locked_until < now()
+            )
+            ORDER BY run_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE jobs AS j
+        SET status = 'running',
+            attempts = j.attempts + 1,
+            locked_until = now() + interval '15 minutes',
+            updated_at = now()
+        FROM next_job
+        WHERE j.id = next_job.id
+        RETURNING
+            j.id,
+            j.kind,
+            j.deployment_id,
+            j.attempts,
+            j.max_attempts
+    `).Scan(
+		&job.ID,
+		&job.Kind,
+		&job.DeploymentID,
+		&job.Attempts,
+		&job.MaxAttempts,
+	)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Job{}, pgx.ErrNoRows
+		}
+		return Job{}, fmt.Errorf("claim next job: %w", err)
+	}
+
+	return job, nil
 }
