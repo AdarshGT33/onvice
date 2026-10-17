@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/AdarshGT33/onvice/internal/api"
+	"github.com/AdarshGT33/onvice/internal/queue"
 	"github.com/AdarshGT33/onvice/internal/store"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -74,30 +76,55 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	worker := queue.NewWorker(db, map[string]queue.Handler{
+		"build": queue.BuildHandler,
+	})
+
+	var workerWG sync.WaitGroup
+	workerWG.Add(1)
+
+	go func() {
+		defer workerWG.Done()
+		worker.Run(ctx)
+	}()
+
 	serverErrors := make(chan error, 1)
 	go func() {
 		log.Printf("Listening on %s", server.Addr)
 		serverErrors <- server.ListenAndServe()
 	}()
 
+	var runErr error
+
 	select {
+	case <-ctx.Done():
+		log.Println("Shutdown signal received")
+
 	case err := <-serverErrors:
 		if !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("server: %w", err)
+			runErr = fmt.Errorf("server: %w", err)
 		}
-		return nil
-	case <-ctx.Done():
-		// Restore default signal handling: a second Ctrl+C exits immediately.
-		stop()
-		log.Println("Shutting down...")
 	}
+
+	stop()
 
 	// Give in-flight requests up to 10 seconds to finish.
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelShutdown()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutting down: %w", err)
+		runErr = errors.Join(
+			runErr,
+			fmt.Errorf("shutting down HTTP server: %w", err),
+		)
+		// Force-close active HTTP connections if graceful shutdown fails.
+		if closeErr := server.Close(); closeErr != nil {
+			runErr = errors.Join(runErr, closeErr)
+		}
 	}
-	return nil
+
+	cancelShutdown()
+
+	workerWG.Wait()
+
+	return runErr
 }
