@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -43,6 +44,12 @@ type Job struct {
 	DeploymentID string `json:"deployment_id"`
 	Attempts     int    `json:"attempts"`
 	MaxAttempts  int    `json:"max_attempts"`
+}
+
+type BuildInput struct {
+	DeploymentID string
+	RepoURL      string
+	CommitSHA    string
 }
 
 // CreateAppWithDeployment atomically creates an app,
@@ -305,5 +312,184 @@ func (s *Store) MarkJobFailed(
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit job failure: %w", err)
 	}
+	return nil
+}
+
+func (s *Store) StartDeploymentBuild(
+	ctx context.Context,
+	deploymentID string,
+) error {
+	tag, err := s.pool.Exec(ctx, `
+        UPDATE deployments
+        SET
+            status = 'building',
+            started_at = COALESCE(started_at, NOW()),
+            updated_at = NOW()
+        WHERE id = $1
+          AND status IN ('queued', 'building')
+    `, deploymentID)
+	if err != nil {
+		return fmt.Errorf("start deployment build: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf(
+			"deployment %s does not exist or cannot enter building state",
+			deploymentID,
+		)
+	}
+
+	return nil
+}
+
+func (s *Store) GetBuildInput(
+	ctx context.Context,
+	deploymentID string,
+) (BuildInput, error) {
+	var input BuildInput
+
+	err := s.pool.QueryRow(ctx, `
+        SELECT
+            d.id::text,
+            a.repo_url,
+            COALESCE(d.commit_sha, '')
+        FROM deployments d
+        JOIN apps a ON a.id = d.app_id
+        WHERE d.id = $1
+    `, deploymentID).Scan(
+		&input.DeploymentID,
+		&input.RepoURL,
+		&input.CommitSHA,
+	)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return BuildInput{}, fmt.Errorf(
+				"deployment %s not found",
+				deploymentID,
+			)
+		}
+
+		return BuildInput{}, fmt.Errorf(
+			"get build input: %w",
+			err,
+		)
+	}
+
+	return input, nil
+}
+
+func (s *Store) PinCommitSHA(
+	ctx context.Context,
+	deploymentID string,
+	sha string,
+) (string, error) {
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		return "", errors.New("commit SHA cannot be empty")
+	}
+
+	var savedSHA string
+
+	err := s.pool.QueryRow(ctx, `
+        UPDATE deployments
+        SET
+            commit_sha = COALESCE(NULLIF(commit_sha, ''), $2),
+            updated_at = NOW()
+        WHERE id = $1
+          AND status = 'building'
+        RETURNING commit_sha
+    `, deploymentID, sha).Scan(&savedSHA)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf(
+				"deployment %s is missing or not in building state",
+				deploymentID,
+			)
+		}
+
+		return "", fmt.Errorf("pin commit SHA: %w", err)
+	}
+
+	return savedSHA, nil
+}
+
+func (s *Store) SaveBuildResult(
+	ctx context.Context,
+	deploymentID string,
+	logOutput string,
+) error {
+	tag, err := s.pool.Exec(ctx, `
+        UPDATE deployments
+        SET
+            build_log = CONCAT(
+                NULLIF(build_log, ''),
+                CASE
+                    WHEN build_log = '' THEN ''
+                    ELSE E'\n'
+                END,
+                $2
+            ),
+            updated_at = NOW()
+        WHERE id = $1
+          AND status = 'building'
+    `, deploymentID, logOutput)
+
+	if err != nil {
+		return fmt.Errorf("save build result: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf(
+			"deployment %s not found or no longer building",
+			deploymentID,
+		)
+	}
+
+	return nil
+}
+
+func (s *Store) SaveBuildFailure(
+	ctx context.Context,
+	deploymentID string,
+	failureStep string,
+	errorMessage string,
+	logOutput string,
+) error {
+	tag, err := s.pool.Exec(ctx, `
+        UPDATE deployments
+        SET
+            failure_step = $2,
+            error_message = $3,
+            build_log = CONCAT(
+                NULLIF(build_log, ''),
+                CASE
+                    WHEN build_log = '' THEN ''
+                    ELSE E'\n'
+                END,
+                $4
+            ),
+            updated_at = NOW()
+        WHERE id = $1
+          AND status = 'building'
+    `,
+		deploymentID,
+		failureStep,
+		errorMessage,
+		logOutput,
+	)
+
+	if err != nil {
+		return fmt.Errorf("save build failure: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf(
+			"deployment %s not found or no longer building",
+			deploymentID,
+		)
+	}
+
 	return nil
 }
