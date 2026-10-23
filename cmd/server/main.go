@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/AdarshGT33/onvice/internal/api"
+	"github.com/AdarshGT33/onvice/internal/builder"
 	"github.com/AdarshGT33/onvice/internal/queue"
 	"github.com/AdarshGT33/onvice/internal/store"
 	"github.com/gin-gonic/gin"
@@ -76,8 +77,10 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	buildService := builder.New(db, "")
+
 	worker := queue.NewWorker(db, map[string]queue.Handler{
-		"build": queue.BuildHandler,
+		"build": buildService.Handle,
 	})
 
 	var workerWG sync.WaitGroup

@@ -13,6 +13,22 @@ import (
 
 var ErrPermanent = errors.New("permanent job failure")
 
+// CHANGED: Permanent marks an error as not worth retrying, without changing
+// its message. Wrapping with fmt.Errorf("%w: ...", ErrPermanent) also works,
+// but adds "permanent job failure:" to the text users see in error_message.
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return permanentError{err: err}
+}
+
+type permanentError struct{ err error }
+
+func (e permanentError) Error() string        { return e.err.Error() }
+func (e permanentError) Unwrap() error        { return e.err }
+func (e permanentError) Is(target error) bool { return target == ErrPermanent }
+
 type Store interface {
 	ClaimNextJob(context.Context) (store.Job, error)
 	RecoverExpiredJobs(context.Context) error
@@ -82,28 +98,35 @@ func (w *Worker) process(parent context.Context, job store.Job) {
 	err := handler(ctx, job)
 	cancel()
 
-	if err == nil {
-		if saveErr := w.store.MarkJobDone(parent, job); saveErr != nil {
-			log.Printf("mark job %s done: %v", job.ID, saveErr)
-		}
-		return
-	}
-
-	if errors.Is(err, ErrPermanent) || job.Attempts >= job.MaxAttempts {
-		w.fail(job, err)
-		return
-	}
-
-	delay := retryDelay(job.Attempts)
-
-	// Use a fresh bounded context so a canceled worker context does not
-	// prevent saving the retry decision during shutdown.
+	// Use a fresh bounded context for every save below, so a cancelled
+	// worker context doesn't stop the outcome from being recorded.
 	saveCtx, saveCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer saveCancel()
 
-	if saveErr := w.store.RetryJob(saveCtx, job, err, delay); saveErr != nil {
-		log.Printf("schedule retry for job %s: %v (original error: %v)",
-			job.ID, saveErr, err)
+	switch {
+	case err == nil:
+		// CHANGED: was the parent context. If shutdown began right after the
+		// job finished, the save failed and the finished job ran again later.
+		if saveErr := w.store.MarkJobDone(saveCtx, job); saveErr != nil {
+			log.Printf("mark job %s done: %v", job.ID, saveErr)
+		}
+
+	case parent.Err() != nil:
+		// CHANGED: shutting down. The job didn't fail, it was interrupted,
+		// so hand it back right away (no delay) for the next start to pick up.
+		if saveErr := w.store.RetryJob(saveCtx, job, err, 0); saveErr != nil {
+			log.Printf("release job %s on shutdown: %v", job.ID, saveErr)
+		}
+
+	case errors.Is(err, ErrPermanent) || job.Attempts >= job.MaxAttempts:
+		w.fail(job, err)
+
+	default:
+		delay := retryDelay(job.Attempts)
+		if saveErr := w.store.RetryJob(saveCtx, job, err, delay); saveErr != nil {
+			log.Printf("schedule retry for job %s: %v (original error: %v)",
+				job.ID, saveErr, err)
+		}
 	}
 }
 
