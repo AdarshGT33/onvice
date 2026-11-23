@@ -44,6 +44,8 @@ type Deployment struct {
 	StartedAt    *time.Time `json:"started_at"`
 	FailureStep  *string    `json:"failure_step"`
 	ErrorMessage *string    `json:"error_message"`
+	ImageTag     *string    `json:"image_tag"` // NEW: set when the build succeeds
+	Port         *int       `json:"port"`      // NEW: detected from the image
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
 }
@@ -58,6 +60,7 @@ type Job struct {
 
 type BuildInput struct {
 	DeploymentID string
+	AppID        string // NEW: used in the image name
 	RepoURL      string
 	Branch       string // CHANGED: empty means the repository's default branch
 	CommitSHA    string
@@ -150,6 +153,7 @@ func (s *Store) GetDeploymentByID(
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, app_id, status,
 		       commit_sha, started_at, failure_step, error_message,
+		       image_tag, port,
 		       created_at, updated_at
 		FROM deployments
 		WHERE id = $1
@@ -161,6 +165,8 @@ func (s *Store) GetDeploymentByID(
 		&deployment.StartedAt,
 		&deployment.FailureStep,
 		&deployment.ErrorMessage,
+		&deployment.ImageTag,
+		&deployment.Port,
 		&deployment.CreatedAt,
 		&deployment.UpdatedAt,
 	)
@@ -229,7 +235,12 @@ func (s *Store) ClaimNextJob(ctx context.Context) (Job, error) {
 }
 
 func (s *Store) RecoverExpiredJobs(ctx context.Context) error {
+	// CHANGED: when the last attempt's lease runs out, the job fails here
+	// and never reaches MarkJobFailed. The second UPDATE fails its
+	// deployment too, otherwise it would show "building" forever.
+	// One statement, so both rows change together or not at all.
 	_, err := s.pool.Exec(ctx, `
+		WITH expired AS (
 		UPDATE jobs
 		SET status = CASE
 				WHEN attempts >= max_attempts THEN 'failed'
@@ -248,6 +259,18 @@ func (s *Store) RecoverExpiredJobs(ctx context.Context) error {
 			updated_at = now()
 		WHERE status = 'running'
 		  AND locked_until < now()
+		RETURNING kind, deployment_id, status
+		)
+		UPDATE deployments AS d
+		SET status = 'build_failed',
+			failure_step = 'worker_timeout',
+			error_message = 'the build stopped responding and all attempts were used',
+			updated_at = now()
+		FROM expired AS e
+		WHERE e.status = 'failed'
+		  AND e.kind = 'build'
+		  AND d.id = e.deployment_id
+		  AND d.status IN ('queued', 'building')
 	`)
 	if err != nil {
 		return fmt.Errorf("recover expired jobs: %w", err)
@@ -316,11 +339,15 @@ func (s *Store) MarkJobFailed(
 	}
 
 	if job.Kind == "build" {
+		// CHANGED: only a deployment that is still being built can be marked
+		// build_failed. Without this guard, a stray failure could overwrite
+		// a deployment that is already built or running.
 		_, err = tx.Exec(ctx, `
 			UPDATE deployments
 			SET status = 'build_failed',
 				updated_at = now()
 			WHERE id = $1
+			  AND status IN ('queued', 'building')
 		`, job.DeploymentID)
 		if err != nil {
 			return fmt.Errorf("mark deployment failed: %w", err)
@@ -368,6 +395,7 @@ func (s *Store) GetBuildInput(
 	err := s.pool.QueryRow(ctx, `
 		SELECT
 			d.id::text,
+			a.id::text,
 			a.repo_url,
 			COALESCE(a.branch, ''),
 			COALESCE(d.commit_sha, '')
@@ -376,6 +404,7 @@ func (s *Store) GetBuildInput(
 		WHERE d.id = $1
 	`, deploymentID).Scan(
 		&input.DeploymentID,
+		&input.AppID,
 		&input.RepoURL,
 		&input.Branch,
 		&input.CommitSHA,
@@ -434,33 +463,37 @@ func (s *Store) PinCommitSHA(
 	return savedSHA, nil
 }
 
-func (s *Store) SaveBuildResult(
+// MarkDeploymentBuilt records a successful build: the image, its port and
+// the build log, and moves the deployment from building to built.
+// NEW: replaces SaveBuildResult.
+func (s *Store) MarkDeploymentBuilt(
 	ctx context.Context,
 	deploymentID string,
+	imageTag string,
+	port int,
 	logOutput string,
 ) error {
-	// CHANGED: clears failure_step and error_message. If an earlier attempt
+	// Also clears failure_step and error_message: if an earlier attempt
 	// failed and this retry succeeded, the old failure must not stay visible.
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE deployments
 		SET
-			build_log = CONCAT(
-				NULLIF(build_log, ''),
-				CASE
-					WHEN build_log = '' THEN ''
-					ELSE E'\n'
-				END,
-				$2
-			),
+			status = 'built',
+			image_tag = $2,
+			port = $3,
+			-- CHANGED: concat_ws skips the NULL from an empty log, so no
+			-- leading newline. ::text because Postgres can't infer a
+			-- parameter's type inside concat (SQLSTATE 42P18).
+			build_log = concat_ws(E'\n', NULLIF(build_log, ''), $4::text),
 			failure_step = NULL,
 			error_message = NULL,
 			updated_at = NOW()
 		WHERE id = $1
 		  AND status = 'building'
-	`, deploymentID, logOutput)
+	`, deploymentID, imageTag, port, logOutput)
 
 	if err != nil {
-		return fmt.Errorf("save build result: %w", err)
+		return fmt.Errorf("mark deployment built: %w", err)
 	}
 
 	if tag.RowsAffected() == 0 {
@@ -485,14 +518,10 @@ func (s *Store) SaveBuildFailure(
 		SET
 			failure_step = $2,
 			error_message = $3,
-			build_log = CONCAT(
-				NULLIF(build_log, ''),
-				CASE
-					WHEN build_log = '' THEN ''
-					ELSE E'\n'
-				END,
-				$4
-			),
+			-- CHANGED: concat_ws skips the NULL from an empty log, so no
+			-- leading newline. ::text because Postgres can't infer a
+			-- parameter's type inside concat (SQLSTATE 42P18).
+			build_log = concat_ws(E'\n', NULLIF(build_log, ''), $4::text),
 			updated_at = NOW()
 		WHERE id = $1
 		  AND status = 'building'

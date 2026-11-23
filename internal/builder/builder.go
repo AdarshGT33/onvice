@@ -20,7 +20,7 @@ type Store interface {
 	StartDeploymentBuild(context.Context, string) error
 	GetBuildInput(context.Context, string) (store.BuildInput, error)
 	PinCommitSHA(context.Context, string, string) (string, error)
-	SaveBuildResult(context.Context, string, string) error
+	MarkDeploymentBuilt(context.Context, string, string, int, string) error
 	SaveBuildFailure(context.Context, string, string, string, string) error
 }
 
@@ -129,11 +129,50 @@ func (b *Builder) Handle(ctx context.Context, job store.Job) error {
 		logs.WriteString("  " + entry.Name() + "\n")
 	}
 
-	// Save the log with a fresh context, so it's saved even during shutdown.
+	// Step 5: build the image. .git is history, not the app: dropping it
+	// keeps it out of the image, and out of what a static site serves.
+	if err := os.RemoveAll(filepath.Join(workDir, ".git")); err != nil {
+		return b.fail(ctx, id, "prepare_build", err, logs.String())
+	}
+	generated, err := prepareDockerfile(workDir)
+	if err != nil {
+		return b.fail(ctx, id, "detect_app", err, logs.String())
+	}
+	if generated == "" {
+		logs.WriteString("Using the repository's own Dockerfile\n")
+	} else {
+		logs.WriteString("Generated Dockerfile:\n" + generated)
+	}
+
+	// One image name per app, one tag per commit: a rebuild of the same
+	// commit replaces its image instead of piling up new ones.
+	imageTag := strings.ToLower("onvice/" + input.AppID + ":" + sha[:12])
+
+	// No extra timeout: the build may use whatever is left of the job's
+	// 10 minutes. A failure here is retried, because a registry or network
+	// hiccup looks the same as broken code from outside.
+	if _, err := run(ctx, 0, workDir, &logs, nil,
+		"docker", "build", "--progress=plain", "-t", imageTag, "."); err != nil {
+		return b.fail(ctx, id, "build_image", err, logs.String())
+	}
+
+	// Step 6: the deployer needs to know which port to route traffic to.
+	inspect, err := run(ctx, time.Minute, "", &logs, nil,
+		"docker", "image", "inspect", "--format", "{{json .Config.ExposedPorts}}", imageTag)
+	if err != nil {
+		return b.fail(ctx, id, "inspect_image", err, logs.String())
+	}
+	port, err := exposedPort(inspect)
+	if err != nil {
+		return b.fail(ctx, id, "inspect_image", err, logs.String())
+	}
+	logs.WriteString(fmt.Sprintf("Built image %s, port %d\n", imageTag, port))
+
+	// Save with a fresh context, so the result is saved even during shutdown.
 	saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := b.db.SaveBuildResult(saveCtx, id, logs.String()); err != nil {
-		return fmt.Errorf("save build log: %w", err)
+	if err := b.db.MarkDeploymentBuilt(saveCtx, id, imageTag, port, logs.String()); err != nil {
+		return fmt.Errorf("save build result: %w", err)
 	}
 	return nil
 }
@@ -173,26 +212,47 @@ func findRef(output, ref string) (string, bool) {
 	return "", false
 }
 
-func runGit(parent context.Context, dir string, logs *strings.Builder, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(parent, 2*time.Minute)
-	defer cancel()
+// FIX 4: the GIT_CONFIG_* trio is the same as "-c credential.helper=":
+// it turns off credential helpers, so Git Credential Manager can't open a
+// sign-in window on Windows. Env instead of a flag keeps args[0] the git
+// subcommand, which error messages and the build log show.
+var gitEnv = []string{
+	"GIT_TERMINAL_PROMPT=0", // never wait for a username in the terminal
+	"GCM_INTERACTIVE=never", // and never in a window
+	"GIT_CONFIG_COUNT=1",
+	"GIT_CONFIG_KEY_0=credential.helper",
+	"GIT_CONFIG_VALUE_0=",
+}
 
-	// FIX 4: "-c credential.helper=" turns off credential helpers, so
-	// Git Credential Manager can't open a sign-in window on Windows.
-	fullArgs := append([]string{"-c", "credential.helper="}, args...)
-
-	cmd := exec.CommandContext(ctx, "git", fullArgs...)
-	if dir != "" {
-		cmd.Dir = dir
+func runGit(ctx context.Context, dir string, logs *strings.Builder, args ...string) (string, error) {
+	output, err := run(ctx, 2*time.Minute, dir, logs, gitEnv, "git", args...)
+	// FIX 2: some git failures will never succeed on retry.
+	// Skipped when the job itself was stopped: that isn't git's fault.
+	if err != nil && ctx.Err() == nil && isPermanentGitFailure(output) {
+		err = queue.Permanent(err)
 	}
-	cmd.Env = append(os.Environ(),
-		"GIT_TERMINAL_PROMPT=0", // never wait for a username in the terminal
-		"GCM_INTERACTIVE=never", // and never in a window
-	)
+	return output, err
+}
+
+// run executes one command and appends it, with its output, to logs.
+// CHANGED: shared by git and docker. timeout 0 means only the job's own
+// deadline applies.
+func run(parent context.Context, timeout time.Duration, dir string, logs *strings.Builder,
+	env []string, name string, args ...string) (string, error) {
+	ctx := parent
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(parent, timeout)
+		defer cancel()
+	}
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir // "" means the current directory
+	cmd.Env = append(os.Environ(), env...)
 
 	output, err := cmd.CombinedOutput()
 
-	logs.WriteString("$ git " + strings.Join(args, " ") + "\n")
+	logs.WriteString("$ " + name + " " + strings.Join(args, " ") + "\n")
 	logs.Write(output)
 	if len(output) == 0 || output[len(output)-1] != '\n' {
 		logs.WriteByte('\n')
@@ -200,21 +260,16 @@ func runGit(parent context.Context, dir string, logs *strings.Builder, args ...s
 
 	if err != nil {
 		// FIX 3: if the job itself was stopped, say so instead of
-		// reporting a git failure.
+		// reporting a command failure.
 		switch {
 		case errors.Is(parent.Err(), context.Canceled):
 			// Shutdown: the worker hands the job back.
 			return "", parent.Err()
 		case parent.Err() != nil:
 			// The job's 10-minute limit ran out: a real failure, worth retrying.
-			return "", fmt.Errorf("git %s: job time limit reached: %w", args[0], parent.Err())
+			return "", fmt.Errorf("%s %s: job time limit reached: %w", name, args[0], parent.Err())
 		}
-		err = fmt.Errorf("git %s failed: %w", args[0], err)
-		// FIX 2: some git failures will never succeed on retry.
-		if isPermanentGitFailure(string(output)) {
-			err = queue.Permanent(err)
-		}
-		return string(output), err
+		return string(output), fmt.Errorf("%s %s failed: %w", name, args[0], err)
 	}
 	return string(output), nil
 }

@@ -125,6 +125,7 @@ func (h *Handler) GetDeployment(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "Invalid deployment ID",
 		})
+		return
 	}
 
 	deployment, err := h.store.GetDeploymentByID(
@@ -144,6 +145,7 @@ func (h *Handler) GetDeployment(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to retrieve deployment",
 		})
+		return
 	}
 
 	c.JSON(http.StatusOK, deployment)
