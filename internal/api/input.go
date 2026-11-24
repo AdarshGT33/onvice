@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
+
+// appName is a valid DNS label (RFC 1123), since the name becomes
+// <name>.<APPS_DOMAIN>. Anything else could never be routed to.
+var appName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 type InputType struct {
 	GithubURL   string `json:"github_url" binding:"required"`
@@ -53,12 +58,14 @@ func (h *Handler) TakingInputofRepoandProjectName(c *gin.Context) {
 		return
 	}
 
-	input.ProjectName = strings.TrimSpace(input.ProjectName)
+	// CHANGED: lowercased, because the name becomes the app's subdomain and
+	// hostnames are case-insensitive: "MyApp" and "myapp" would be one URL.
+	input.ProjectName = strings.ToLower(strings.TrimSpace(input.ProjectName))
 	input.GithubURL = strings.TrimSpace(input.GithubURL)
 
-	if input.ProjectName == "" {
+	if !appName.MatchString(input.ProjectName) {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Project Name cannot be empty",
+			"error": "Project name becomes your app's subdomain: use 1-63 letters, digits or hyphens, starting and ending with a letter or digit",
 		})
 		return
 	}
@@ -116,6 +123,46 @@ func (h *Handler) TakingInputofRepoandProjectName(c *gin.Context) {
 		"status":        deployment.Status,
 	})
 
+}
+
+// Redeploy builds the app's latest commit and swaps it in with no
+// downtime: the current version keeps serving until the new one is healthy.
+// It is also how a user recovers after a failed deploy: push a fix, redeploy.
+// NEW: POST /api/v1/projects/:name/deployments
+func (h *Handler) Redeploy(c *gin.Context) {
+	// Lowercase, like at creation: the name is a hostname.
+	name := strings.ToLower(c.Param("name"))
+
+	deployment, err := h.store.CreateDeployment(c.Request.Context(), name)
+	switch {
+	case errors.Is(err, store.ErrAppNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "No project named " + name})
+		return
+	case errors.Is(err, store.ErrDeploymentInProgress):
+		// 409: the app is mid-deploy. Point at that deployment so the
+		// client can follow it and redeploy once it settles.
+		body := gin.H{"error": "A deployment of this project is already in progress; wait for it to finish, then redeploy"}
+		if deployment.ID != "" {
+			body["deployment_id"] = deployment.ID
+			body["status"] = deployment.Status
+		}
+		c.JSON(http.StatusConflict, body)
+		return
+	case err != nil:
+		_ = c.Error(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create deployment"})
+		return
+	}
+
+	// 202: accepted, the work happens in the background. Same shape as
+	// POST /projects, so clients poll GET /deployments/:id either way.
+	c.JSON(http.StatusAccepted, gin.H{
+		"message":       "Deployment queued",
+		"app_id":        deployment.AppID,
+		"name":          name,
+		"deployment_id": deployment.ID,
+		"status":        deployment.Status,
+	})
 }
 
 func (h *Handler) GetDeployment(c *gin.Context) {

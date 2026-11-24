@@ -21,7 +21,9 @@ type Store interface {
 	GetBuildInput(context.Context, string) (store.BuildInput, error)
 	PinCommitSHA(context.Context, string, string) (string, error)
 	MarkDeploymentBuilt(context.Context, string, string, int, string) error
-	SaveBuildFailure(context.Context, string, string, string, string) error
+	SaveFailure(context.Context, string, string, string, string) error
+	StartDeploymentDeploy(context.Context, string) (store.DeployInput, error)
+	MarkDeploymentHealthy(context.Context, string, int, string) error
 }
 
 type Builder struct {
@@ -303,7 +305,7 @@ func (b *Builder) fail(ctx context.Context, deploymentID, step string, cause err
 	saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if saveErr := b.db.SaveBuildFailure(saveCtx, deploymentID, step, cause.Error(), logText); saveErr != nil {
+	if saveErr := b.db.SaveFailure(saveCtx, deploymentID, step, cause.Error(), logText); saveErr != nil {
 		return fmt.Errorf("%s failed: %w; also failed to save failure details: %v", step, cause, saveErr)
 	}
 	// %w keeps queue.ErrPermanent visible to the worker.

@@ -16,6 +16,7 @@ import (
 	"github.com/AdarshGT33/onvice/internal/api"
 	"github.com/AdarshGT33/onvice/internal/builder"
 	"github.com/AdarshGT33/onvice/internal/queue"
+	"github.com/AdarshGT33/onvice/internal/router"
 	"github.com/AdarshGT33/onvice/internal/store"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -68,6 +69,7 @@ func run() error {
 	r := gin.Default()
 	v1 := r.Group("/api/v1")
 	v1.POST("/projects", h.TakingInputofRepoandProjectName)
+	v1.POST("/projects/:name/deployments", h.Redeploy)
 	v1.GET("/deployments/:id", h.GetDeployment)
 
 	server := &http.Server{
@@ -77,10 +79,21 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// NEW: app traffic gets its own listener, separate from the platform API,
+	// so a visitor to someone's app can never reach /api/v1, and each side
+	// can later get its own TLS, limits and firewall rules.
+	routerServer := &http.Server{
+		Addr:              envOr("ROUTER_ADDR", ":8000"),
+		Handler:           router.New(db, envOr("APPS_DOMAIN", "localhost")),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	servers := []*http.Server{server, routerServer}
+
 	buildService := builder.New(db, "")
 
 	worker := queue.NewWorker(db, map[string]queue.Handler{
-		"build": buildService.Handle,
+		"build":  buildService.Handle,
+		"deploy": buildService.Deploy,
 	})
 
 	var workerWG sync.WaitGroup
@@ -91,11 +104,13 @@ func run() error {
 		worker.Run(ctx)
 	}()
 
-	serverErrors := make(chan error, 1)
-	go func() {
-		log.Printf("Listening on %s", server.Addr)
-		serverErrors <- server.ListenAndServe()
-	}()
+	serverErrors := make(chan error, len(servers))
+	for _, s := range servers {
+		go func() {
+			log.Printf("Listening on %s", s.Addr)
+			serverErrors <- s.ListenAndServe()
+		}()
+	}
 
 	var runErr error
 
@@ -114,14 +129,18 @@ func run() error {
 	// Give in-flight requests up to 10 seconds to finish.
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		runErr = errors.Join(
-			runErr,
-			fmt.Errorf("shutting down HTTP server: %w", err),
-		)
-		// Force-close active HTTP connections if graceful shutdown fails.
-		if closeErr := server.Close(); closeErr != nil {
-			runErr = errors.Join(runErr, closeErr)
+	// Shutdown never stops app containers: apps keep running while the
+	// platform restarts; only routing pauses.
+	for _, s := range servers {
+		if err := s.Shutdown(shutdownCtx); err != nil {
+			runErr = errors.Join(
+				runErr,
+				fmt.Errorf("shutting down HTTP server %s: %w", s.Addr, err),
+			)
+			// Force-close active HTTP connections if graceful shutdown fails.
+			if closeErr := s.Close(); closeErr != nil {
+				runErr = errors.Join(runErr, closeErr)
+			}
 		}
 	}
 
@@ -130,4 +149,12 @@ func run() error {
 	workerWG.Wait()
 
 	return runErr
+}
+
+// envOr returns the environment variable, or def when it is unset.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }

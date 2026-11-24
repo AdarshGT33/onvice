@@ -46,6 +46,7 @@ type Deployment struct {
 	ErrorMessage *string    `json:"error_message"`
 	ImageTag     *string    `json:"image_tag"` // NEW: set when the build succeeds
 	Port         *int       `json:"port"`      // NEW: detected from the image
+	HostPort     *int       `json:"host_port"` // NEW: where the live container answers
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
 }
@@ -142,6 +143,51 @@ func (s *Store) CreateAppWithDeployment(
 	return app, deployment, nil
 }
 
+// ErrDeploymentInProgress: the app already has a deployment in the pipeline.
+var ErrDeploymentInProgress = errors.New("a deployment of this app is already in progress")
+
+// CreateDeployment queues a new deployment of an existing app: a fresh
+// build of the latest commit on its branch, then a zero-downtime swap.
+// On ErrDeploymentInProgress it returns the deployment in progress, so
+// the caller can tell the user which one to wait for.
+func (s *Store) CreateDeployment(ctx context.Context, appName string) (Deployment, error) {
+	var d Deployment
+	// One statement: the deployment and its build job exist together or
+	// not at all, the same guarantee CreateAppWithDeployment gives.
+	err := s.pool.QueryRow(ctx, `
+		WITH d AS (
+			INSERT INTO deployments (app_id, status)
+			SELECT id, 'queued' FROM apps WHERE name = $1
+			RETURNING id, app_id, status, created_at, updated_at
+		), j AS (
+			INSERT INTO jobs (deployment_id, kind, status)
+			SELECT id, 'build', 'pending' FROM d
+		)
+		SELECT id, app_id, status, created_at, updated_at FROM d
+	`, appName).Scan(&d.ID, &d.AppID, &d.Status, &d.CreatedAt, &d.UpdatedAt)
+
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return Deployment{}, ErrAppNotFound
+	case errors.As(err, &pgErr) && pgErr.ConstraintName == "deployments_one_in_progress_per_app":
+		err = s.pool.QueryRow(ctx, `
+			SELECT d.id, d.app_id, d.status, d.created_at, d.updated_at
+			FROM deployments d JOIN apps a ON a.id = d.app_id
+			WHERE a.name = $1
+			  AND d.status IN ('queued', 'building', 'built', 'deploying')
+		`, appName).Scan(&d.ID, &d.AppID, &d.Status, &d.CreatedAt, &d.UpdatedAt)
+		if err != nil {
+			// It finished between the two queries; the client can just retry.
+			return Deployment{}, ErrDeploymentInProgress
+		}
+		return d, ErrDeploymentInProgress
+	case err != nil:
+		return Deployment{}, fmt.Errorf("create deployment: %w", err)
+	}
+	return d, nil
+}
+
 // GetDeploymentByID retrieves a deployment by its ID.
 func (s *Store) GetDeploymentByID(
 	ctx context.Context,
@@ -153,7 +199,7 @@ func (s *Store) GetDeploymentByID(
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, app_id, status,
 		       commit_sha, started_at, failure_step, error_message,
-		       image_tag, port,
+		       image_tag, port, host_port,
 		       created_at, updated_at
 		FROM deployments
 		WHERE id = $1
@@ -167,6 +213,7 @@ func (s *Store) GetDeploymentByID(
 		&deployment.ErrorMessage,
 		&deployment.ImageTag,
 		&deployment.Port,
+		&deployment.HostPort,
 		&deployment.CreatedAt,
 		&deployment.UpdatedAt,
 	)
@@ -262,15 +309,16 @@ func (s *Store) RecoverExpiredJobs(ctx context.Context) error {
 		RETURNING kind, deployment_id, status
 		)
 		UPDATE deployments AS d
-		SET status = 'build_failed',
+		SET status = CASE e.kind WHEN 'build' THEN 'build_failed' ELSE 'failed' END,
 			failure_step = 'worker_timeout',
-			error_message = 'the build stopped responding and all attempts were used',
+			error_message = 'the ' || e.kind || ' stopped responding and all attempts were used',
 			updated_at = now()
 		FROM expired AS e
 		WHERE e.status = 'failed'
-		  AND e.kind = 'build'
 		  AND d.id = e.deployment_id
-		  AND d.status IN ('queued', 'building')
+		  -- Same per-kind guard as MarkJobFailed.
+		  AND ((e.kind = 'build' AND d.status IN ('queued', 'building'))
+		    OR (e.kind = 'deploy' AND d.status IN ('built', 'deploying')))
 	`)
 	if err != nil {
 		return fmt.Errorf("recover expired jobs: %w", err)
@@ -338,20 +386,19 @@ func (s *Store) MarkJobFailed(
 		return fmt.Errorf("mark job failed: %w", err)
 	}
 
-	if job.Kind == "build" {
-		// CHANGED: only a deployment that is still being built can be marked
-		// build_failed. Without this guard, a stray failure could overwrite
-		// a deployment that is already built or running.
-		_, err = tx.Exec(ctx, `
-			UPDATE deployments
-			SET status = 'build_failed',
-				updated_at = now()
-			WHERE id = $1
-			  AND status IN ('queued', 'building')
-		`, job.DeploymentID)
-		if err != nil {
-			return fmt.Errorf("mark deployment failed: %w", err)
-		}
+	// CHANGED: each job kind may only fail the stages it owns. A stray build
+	// failure must never overwrite a deployment that is built or live, and a
+	// deploy failure must never touch one that is still building.
+	_, err = tx.Exec(ctx, `
+		UPDATE deployments
+		SET status = CASE $2::text WHEN 'build' THEN 'build_failed' ELSE 'failed' END,
+			updated_at = now()
+		WHERE id = $1
+		  AND (($2::text = 'build' AND status IN ('queued', 'building'))
+		    OR ($2::text = 'deploy' AND status IN ('built', 'deploying')))
+	`, job.DeploymentID, job.Kind)
+	if err != nil {
+		return fmt.Errorf("mark deployment failed: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -475,7 +522,10 @@ func (s *Store) MarkDeploymentBuilt(
 ) error {
 	// Also clears failure_step and error_message: if an earlier attempt
 	// failed and this retry succeeded, the old failure must not stay visible.
+	// CHANGED: the same statement queues the deploy job, so a crash can't
+	// leave a built deployment that nothing will ever deploy.
 	tag, err := s.pool.Exec(ctx, `
+		WITH built AS (
 		UPDATE deployments
 		SET
 			status = 'built',
@@ -490,6 +540,10 @@ func (s *Store) MarkDeploymentBuilt(
 			updated_at = NOW()
 		WHERE id = $1
 		  AND status = 'building'
+		RETURNING id
+		)
+		INSERT INTO jobs (deployment_id, kind, status)
+		SELECT id, 'deploy', 'pending' FROM built
 	`, deploymentID, imageTag, port, logOutput)
 
 	if err != nil {
@@ -506,7 +560,10 @@ func (s *Store) MarkDeploymentBuilt(
 	return nil
 }
 
-func (s *Store) SaveBuildFailure(
+// SaveFailure records why a build or deploy attempt failed. The status is
+// left alone: the worker decides between a retry and giving up.
+// CHANGED: was SaveBuildFailure; now also used while deploying.
+func (s *Store) SaveFailure(
 	ctx context.Context,
 	deploymentID string,
 	failureStep string,
@@ -524,7 +581,7 @@ func (s *Store) SaveBuildFailure(
 			build_log = concat_ws(E'\n', NULLIF(build_log, ''), $4::text),
 			updated_at = NOW()
 		WHERE id = $1
-		  AND status = 'building'
+		  AND status IN ('building', 'deploying')
 	`,
 		deploymentID,
 		failureStep,
@@ -533,15 +590,136 @@ func (s *Store) SaveBuildFailure(
 	)
 
 	if err != nil {
-		return fmt.Errorf("save build failure: %w", err)
+		return fmt.Errorf("save failure: %w", err)
 	}
 
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf(
-			"deployment %s not found or no longer building",
+			"deployment %s not found or not building or deploying",
 			deploymentID,
 		)
 	}
 
 	return nil
+}
+
+// ErrNotDeployable: the deployment isn't waiting to be deployed (missing,
+// still building, already live, or failed). Retrying can't change that.
+var ErrNotDeployable = errors.New("deployment does not exist or cannot enter deploying state")
+
+type DeployInput struct {
+	AppID    string
+	ImageTag string
+	Port     int // the port the app listens on inside the container
+}
+
+// StartDeploymentDeploy moves a built deployment to deploying and returns
+// what the deployer needs. 'deploying' is accepted too, so a retried or
+// recovered job can pick up where the last attempt stopped.
+func (s *Store) StartDeploymentDeploy(ctx context.Context, deploymentID string) (DeployInput, error) {
+	var in DeployInput
+	err := s.pool.QueryRow(ctx, `
+		UPDATE deployments
+		SET status = 'deploying',
+			updated_at = now()
+		WHERE id = $1
+		  AND status IN ('built', 'deploying')
+		  AND image_tag IS NOT NULL
+		  AND port IS NOT NULL
+		RETURNING app_id::text, image_tag, port
+	`, deploymentID).Scan(&in.AppID, &in.ImageTag, &in.Port)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DeployInput{}, fmt.Errorf("deployment %s: %w", deploymentID, ErrNotDeployable)
+	}
+	if err != nil {
+		return DeployInput{}, fmt.Errorf("start deployment deploy: %w", err)
+	}
+	return in, nil
+}
+
+// MarkDeploymentHealthy makes this deployment the app's live one and marks
+// the app's previous live deployment superseded, in one transaction, so the
+// database never shows two live deployments or none.
+func (s *Store) MarkDeploymentHealthy(
+	ctx context.Context,
+	deploymentID string,
+	hostPort int,
+	logOutput string,
+) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin healthy transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// CHANGED: old one out first, then new one in. The unique index
+	// deployments_one_live_per_app is checked after every statement, not at
+	// commit, so the reverse order would briefly have two live rows and fail.
+	// Other readers (the router) still see the switch as one instant.
+	_, err = tx.Exec(ctx, `
+		UPDATE deployments
+		SET status = 'superseded',
+			host_port = NULL, -- its container is about to be stopped
+			updated_at = now()
+		WHERE app_id = (SELECT app_id FROM deployments WHERE id = $1)
+		  AND id <> $1
+		  AND status = 'healthy'
+	`, deploymentID)
+	if err != nil {
+		return fmt.Errorf("supersede previous deployment: %w", err)
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE deployments
+		SET status = 'healthy',
+			host_port = $2,
+			build_log = concat_ws(E'\n', NULLIF(build_log, ''), $3::text),
+			failure_step = NULL,
+			error_message = NULL,
+			updated_at = now()
+		WHERE id = $1
+		  AND status = 'deploying'
+	`, deploymentID, hostPort, logOutput)
+	if err != nil {
+		return fmt.Errorf("mark deployment healthy: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Returning here rolls back the supersede above too.
+		return fmt.Errorf("deployment %s not found or no longer deploying", deploymentID)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit healthy deployment: %w", err)
+	}
+	return nil
+}
+
+var (
+	ErrAppNotFound = errors.New("no app with this name")
+	ErrAppNotLive  = errors.New("app has no live deployment")
+)
+
+// LiveHostPort returns the host port of the app's live container. The
+// router calls it on every request, so a swap takes effect on the very
+// next request. LEFT JOIN tells "no such app" (404) apart from "app
+// exists but isn't running" (503) in one query.
+func (s *Store) LiveHostPort(ctx context.Context, appName string) (int, error) {
+	var port *int
+	err := s.pool.QueryRow(ctx, `
+		SELECT d.host_port
+		FROM apps a
+		LEFT JOIN deployments d
+		       ON d.app_id = a.id
+		      AND d.status = 'healthy'
+		WHERE a.name = $1
+	`, appName).Scan(&port)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return 0, ErrAppNotFound
+	case err != nil:
+		return 0, fmt.Errorf("look up live deployment: %w", err)
+	case port == nil:
+		return 0, ErrAppNotLive
+	}
+	return *port, nil
 }
