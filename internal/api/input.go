@@ -219,6 +219,50 @@ func (h *Handler) Redeploy(c *gin.Context) {
 	})
 }
 
+// Rollback puts the app's previous successful version back live, reusing
+// its image: no clone, no build, so it takes seconds, not minutes, which
+// matters most exactly when a bad deploy is hurting users. Calling it
+// again rolls forward to the version just replaced.
+// NEW: POST /api/v1/projects/:name/rollback
+func (h *Handler) Rollback(c *gin.Context) {
+	name := strings.ToLower(c.Param("name"))
+
+	deployment, err := h.store.CreateRollback(c.Request.Context(), auth.UserID(c), name)
+	switch {
+	case errors.Is(err, store.ErrAppNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "No project named " + name})
+		return
+	case errors.Is(err, store.ErrNoRollbackTarget):
+		c.JSON(http.StatusConflict, gin.H{"error": "This project has no previous successful version to roll back to"})
+		return
+	case errors.Is(err, store.ErrDeploymentInProgress):
+		// Same rule as redeploy: one deployment in flight per app.
+		body := gin.H{"error": "A deployment of this project is already in progress; wait for it to finish, then roll back"}
+		if deployment.ID != "" {
+			body["deployment_id"] = deployment.ID
+			body["status"] = deployment.Status
+		}
+		c.JSON(http.StatusConflict, body)
+		return
+	case err != nil:
+		_ = c.Error(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start rollback"})
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"message":       "Rollback queued",
+		"app_id":        deployment.AppID,
+		"name":          name,
+		"url":           h.url(name),
+		"deployment_id": deployment.ID,
+		"status":        deployment.Status,
+		// Which version is coming back, so the user can confirm it's the right one.
+		"commit_sha": deployment.CommitSHA,
+		"image_tag":  deployment.ImageTag,
+	})
+}
+
 // DeploymentLogs returns a deployment's build and deploy log: every git,
 // docker build and health-check step with its output, so users can see
 // why a deploy failed, not just the one-line error_message.

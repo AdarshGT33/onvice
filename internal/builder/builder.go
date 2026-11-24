@@ -24,6 +24,7 @@ type Store interface {
 	SaveFailure(context.Context, string, string, string, string) error
 	StartDeploymentDeploy(context.Context, string) (store.DeployInput, error)
 	MarkDeploymentHealthy(context.Context, string, int, string) error
+	KeepImageTags(context.Context, string) ([]string, error)
 }
 
 type Builder struct {
@@ -146,15 +147,19 @@ func (b *Builder) Handle(ctx context.Context, job store.Job) error {
 		logs.WriteString("Generated Dockerfile:\n" + generated)
 	}
 
-	// One image name per app, one tag per commit: a rebuild of the same
-	// commit replaces its image instead of piling up new ones.
+	// One image name per app, one tag per commit. A rebuild of the same
+	// commit moves the tag to the new image and leaves the old one untagged
+	// ("dangling"); the label below is how cleanup still finds it.
 	imageTag := strings.ToLower("onvice/" + input.AppID + ":" + sha[:12])
 
 	// No extra timeout: the build may use whatever is left of the job's
 	// 10 minutes. A failure here is retried, because a registry or network
 	// hiccup looks the same as broken code from outside.
 	if _, err := run(ctx, 0, workDir, &logs, nil,
-		"docker", "build", "--progress=plain", "-t", imageTag, "."); err != nil {
+		"docker", "build", "--progress=plain", "-t", imageTag,
+		// NEW: marks the image as this app's, even after it loses its tag.
+		"--label", "onvice.app="+input.AppID,
+		"."); err != nil {
 		return b.fail(ctx, id, "build_image", err, logs.String())
 	}
 

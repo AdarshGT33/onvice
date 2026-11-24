@@ -71,6 +71,11 @@ func (b *Builder) Deploy(ctx context.Context, job store.Job) (err error) {
 		// router. A separate host port per container, so two apps that
 		// both listen on 8080 inside never clash outside.
 		"--publish", "127.0.0.1:"+strconv.Itoa(hostPort)+":"+port,
+		// NEW: only run images this machine built. If a local image is
+		// missing (e.g. cleaned up), fail clearly instead of letting Docker
+		// download a same-named image from a public registry, which could
+		// be anyone's code.
+		"--pull", "never",
 		in.ImageTag); err != nil {
 		// Includes "port is already allocated" if something grabbed the
 		// port in the moment since freePort; the retry picks a new one.
@@ -98,7 +103,60 @@ func (b *Builder) Deploy(ctx context.Context, job store.Job) (err error) {
 
 	// Only now, with the new version live, remove the app's other containers.
 	removeOtherContainers(in.AppID, name)
+	// Then the images nothing needs anymore. After the containers, because
+	// Docker refuses to delete an image a container still uses.
+	b.pruneImages(in.AppID)
 	return nil
+}
+
+// pruneImages deletes the app's images except the ones KeepImageTags
+// names: the live version and the previous one (the rollback target).
+// Each build is ~350-500 MB; without this, every deploy permanently
+// costs that much disk. Best effort: a failure only means disk is
+// reclaimed on the next successful deploy instead.
+func (b *Builder) pruneImages(appID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	keepTags, err := b.db.KeepImageTags(ctx, appID)
+	if err != nil {
+		// Never delete without knowing what to keep.
+		log.Printf("prune images of app %s: %v", appID, err)
+		return
+	}
+	keep := map[string]bool{}
+	for _, t := range keepTags {
+		keep[t] = true
+	}
+
+	var discard strings.Builder
+	// Untagged leftovers of this app's same-commit rebuilds. "image prune"
+	// only touches dangling images, so tagged (kept) ones are never at risk.
+	if _, err := run(ctx, 0, "", &discard, nil, "docker", "image", "prune", "--force",
+		"--filter", "label=onvice.app="+appID); err != nil {
+		log.Printf("prune dangling images of app %s: %v", appID, err)
+	}
+
+	out, err := run(ctx, 0, "", &discard, nil, "docker", "images",
+		"--filter", "reference=onvice/"+appID, "--format", "{{.Repository}}:{{.Tag}}")
+	if err != nil {
+		log.Printf("list images of app %s: %v", appID, err)
+		return
+	}
+	var drop []string
+	for _, tag := range strings.Fields(out) {
+		if !keep[tag] {
+			drop = append(drop, tag)
+		}
+	}
+	if len(drop) == 0 {
+		return
+	}
+	// No --force: if a container somehow still uses an image, Docker keeps
+	// it, which is exactly the safe outcome.
+	if _, err := run(ctx, 0, "", &discard, nil, "docker", append([]string{"rmi"}, drop...)...); err != nil {
+		log.Printf("remove images %v: %v", drop, err)
+	}
 }
 
 // containerName is the one place the naming rule lives, so the deployer

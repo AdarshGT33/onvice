@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -74,10 +75,34 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("ROUTER_ADDR %q: %w", routerAddr, err)
 	}
-	// NEW: the public URL users are shown. Locally it is what the router
-	// listens on; in production, behind TLS or a load balancer, set
+	// NEW: TLS. Set both TLS_CERT_FILE and TLS_KEY_FILE and the API and the
+	// app router serve HTTPS only; API keys and app traffic are encrypted.
+	// The certificate must cover the API's host and *.APPS_DOMAIN.
+	// Unset: plain HTTP, for local development.
+	certFile, keyFile := os.Getenv("TLS_CERT_FILE"), os.Getenv("TLS_KEY_FILE")
+	if (certFile == "") != (keyFile == "") {
+		// Half-configured TLS must not quietly fall back to plain HTTP.
+		return errors.New("set both TLS_CERT_FILE and TLS_KEY_FILE, or neither")
+	}
+	var tlsConfig *tls.Config
+	scheme := "http"
+	if certFile != "" {
+		certs, err := newCertReloader(certFile, keyFile)
+		if err != nil {
+			return err
+		}
+		// TLS 1.2 floor: older versions have known weaknesses, and every
+		// current browser and HTTP client supports 1.2+.
+		tlsConfig = &tls.Config{GetCertificate: certs.getCertificate, MinVersion: tls.VersionTLS12}
+		scheme = "https"
+	} else {
+		log.Println("WARNING: TLS is off; API keys travel unencrypted. Set TLS_CERT_FILE and TLS_KEY_FILE outside local development.")
+	}
+
+	// NEW: the public URL users are shown. By default it is what the
+	// router serves; behind a load balancer or another domain layout, set
 	// APP_URL_TEMPLATE, e.g. https://{name}.apps.example.com
-	appURL := envOr("APP_URL_TEMPLATE", "http://{name}."+appsDomain+":"+routerPort)
+	appURL := envOr("APP_URL_TEMPLATE", defaultAppURL(scheme, appsDomain, routerPort))
 	if !strings.Contains(appURL, "{name}") {
 		// Fail at startup, not by showing every user the same wrong URL.
 		return fmt.Errorf("APP_URL_TEMPLATE %q must contain {name}", appURL)
@@ -92,6 +117,7 @@ func run() error {
 	v1.GET("/projects", h.ListProjects)
 	v1.POST("/projects", h.TakingInputofRepoandProjectName)
 	v1.POST("/projects/:name/deployments", h.Redeploy)
+	v1.POST("/projects/:name/rollback", h.Rollback)
 	v1.GET("/deployments/:id", h.GetDeployment)
 	v1.GET("/deployments/:id/logs", h.DeploymentLogs)
 	v1.GET("/projects/:name/logs", h.AppLogs)
@@ -101,6 +127,7 @@ func run() error {
 		Handler: r,
 		// Stops slow clients from holding connections open forever.
 		ReadHeaderTimeout: 10 * time.Second,
+		TLSConfig:         tlsConfig, // nil = plain HTTP
 	}
 
 	// NEW: app traffic gets its own listener, separate from the platform API,
@@ -110,8 +137,23 @@ func run() error {
 		Addr:              routerAddr,
 		Handler:           router.New(db, appsDomain),
 		ReadHeaderTimeout: 10 * time.Second,
+		TLSConfig:         tlsConfig,
 	}
 	servers := []*http.Server{server, routerServer}
+
+	// NEW: optional plain-HTTP listener (normally ":80") that only
+	// redirects app visitors to https. Browsers try http:// first when
+	// someone types an address; without this they'd get nothing.
+	if addr := os.Getenv("HTTP_REDIRECT_ADDR"); addr != "" {
+		if tlsConfig == nil {
+			return errors.New("HTTP_REDIRECT_ADDR needs TLS: there is no https to redirect to")
+		}
+		servers = append(servers, &http.Server{
+			Addr:              addr,
+			Handler:           httpsRedirect(appsDomain, routerPort),
+			ReadHeaderTimeout: 10 * time.Second,
+		})
+	}
 
 	buildService := builder.New(db, "")
 
@@ -131,7 +173,14 @@ func run() error {
 	serverErrors := make(chan error, len(servers))
 	for _, s := range servers {
 		go func() {
-			log.Printf("Listening on %s", s.Addr)
+			if s.TLSConfig != nil {
+				log.Printf("Listening on %s (https)", s.Addr)
+				// Empty file names: the certificate comes from
+				// TLSConfig.GetCertificate, so renewals are picked up.
+				serverErrors <- s.ListenAndServeTLS("", "")
+				return
+			}
+			log.Printf("Listening on %s (http)", s.Addr)
 			serverErrors <- s.ListenAndServe()
 		}()
 	}

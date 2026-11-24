@@ -258,21 +258,113 @@ func (s *Store) CreateDeployment(ctx context.Context, ownerID, appName string) (
 	case errors.Is(err, pgx.ErrNoRows):
 		return Deployment{}, ErrAppNotFound
 	case errors.As(err, &pgErr) && pgErr.ConstraintName == "deployments_one_in_progress_per_app":
-		err = s.pool.QueryRow(ctx, `
-			SELECT d.id, d.app_id, d.status, d.created_at, d.updated_at
-			FROM deployments d JOIN apps a ON a.id = d.app_id
-			WHERE a.name = $1 AND a.owner_id = $2
-			  AND d.status IN ('queued', 'building', 'built', 'deploying')
-		`, appName, ownerID).Scan(&d.ID, &d.AppID, &d.Status, &d.CreatedAt, &d.UpdatedAt)
-		if err != nil {
-			// It finished between the two queries; the client can just retry.
-			return Deployment{}, ErrDeploymentInProgress
-		}
-		return d, ErrDeploymentInProgress
+		return s.inProgress(ctx, ownerID, appName)
 	case err != nil:
 		return Deployment{}, fmt.Errorf("create deployment: %w", err)
 	}
 	return d, nil
+}
+
+// inProgress returns the app's deployment that is in the pipeline, always
+// with ErrDeploymentInProgress, so the caller can say which one to wait for.
+// Shared by redeploy and rollback, which both hit the same unique index.
+func (s *Store) inProgress(ctx context.Context, ownerID, appName string) (Deployment, error) {
+	var d Deployment
+	err := s.pool.QueryRow(ctx, `
+		SELECT d.id, d.app_id, d.status, d.created_at, d.updated_at
+		FROM deployments d JOIN apps a ON a.id = d.app_id
+		WHERE a.name = $1 AND a.owner_id = $2
+		  AND d.status IN ('queued', 'building', 'built', 'deploying')
+	`, appName, ownerID).Scan(&d.ID, &d.AppID, &d.Status, &d.CreatedAt, &d.UpdatedAt)
+	if err != nil {
+		// It finished between the two queries; the client can just retry.
+		return Deployment{}, ErrDeploymentInProgress
+	}
+	return d, ErrDeploymentInProgress
+}
+
+// ErrNoRollbackTarget: the app has never had a version before the current
+// one (or none at all), so there is nothing to go back to.
+var ErrNoRollbackTarget = errors.New("no previous successful version to roll back to")
+
+// The "previous successful version" of an app: the deployment that was
+// live most recently before the current one. One definition, used both
+// to pick the rollback target and to decide which image cleanup keeps,
+// so the image a rollback needs is always still on disk.
+// superseded rows are never updated again, so updated_at = when it was replaced.
+const previousVersionSQL = `
+	SELECT id FROM deployments
+	WHERE app_id = $1 AND status = 'superseded' AND image_tag IS NOT NULL
+	ORDER BY updated_at DESC
+	LIMIT 1`
+
+// CreateRollback queues a deployment of the app's previous successful
+// version. It reuses that version's image, so it starts at 'built' with a
+// deploy job: no clone, no build, live in seconds, through the same
+// health-checked, zero-downtime swap as any deploy. Rolling back twice
+// rolls forward again: after a rollback, the "previous" version is the
+// one just replaced.
+func (s *Store) CreateRollback(ctx context.Context, ownerID, appName string) (Deployment, error) {
+	var appID string
+	err := s.pool.QueryRow(ctx, `SELECT id::text FROM apps WHERE name = $1 AND owner_id = $2`,
+		appName, ownerID).Scan(&appID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Deployment{}, ErrAppNotFound
+	}
+	if err != nil {
+		return Deployment{}, fmt.Errorf("create rollback: %w", err)
+	}
+
+	var d Deployment
+	err = s.pool.QueryRow(ctx, `
+		WITH target AS (
+			SELECT app_id, image_tag, port, commit_sha
+			FROM deployments
+			WHERE id = (`+previousVersionSQL+`)
+		), d AS (
+			INSERT INTO deployments (app_id, status, image_tag, port, commit_sha, build_log)
+			SELECT app_id, 'built', image_tag, port, commit_sha,
+			       'Rollback: reusing image ' || image_tag || ' (no build)'
+			FROM target
+			RETURNING id, app_id, status, commit_sha, image_tag, created_at, updated_at
+		), j AS (
+			INSERT INTO jobs (deployment_id, kind, status)
+			SELECT id, 'deploy', 'pending' FROM d
+		)
+		SELECT id, app_id, status, commit_sha, image_tag, created_at, updated_at FROM d
+	`, appID).Scan(&d.ID, &d.AppID, &d.Status, &d.CommitSHA, &d.ImageTag, &d.CreatedAt, &d.UpdatedAt)
+
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// The app is the caller's (checked above) but has no previous version.
+		return Deployment{}, ErrNoRollbackTarget
+	case errors.As(err, &pgErr) && pgErr.ConstraintName == "deployments_one_in_progress_per_app":
+		return s.inProgress(ctx, ownerID, appName)
+	case err != nil:
+		return Deployment{}, fmt.Errorf("create rollback: %w", err)
+	}
+	return d, nil
+}
+
+// KeepImageTags lists the app's images that cleanup must not delete: the
+// live version, the previous version (the rollback target), and anything
+// mid-deploy.
+func (s *Store) KeepImageTags(ctx context.Context, appID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT image_tag FROM deployments
+		WHERE app_id = $1 AND image_tag IS NOT NULL
+		  AND (status IN ('healthy', 'built', 'deploying')
+		       OR id = (`+previousVersionSQL+`))
+	`, appID)
+	if err != nil {
+		return nil, fmt.Errorf("list images to keep: %w", err)
+	}
+	tags, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("list images to keep: %w", err)
+	}
+	return tags, nil
 }
 
 // GetDeploymentByID retrieves a deployment by its ID, if ownerID owns its app.
