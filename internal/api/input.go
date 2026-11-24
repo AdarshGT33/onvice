@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/AdarshGT33/onvice/internal/auth"
+	"github.com/AdarshGT33/onvice/internal/builder"
 	"github.com/AdarshGT33/onvice/internal/store"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -216,6 +217,82 @@ func (h *Handler) Redeploy(c *gin.Context) {
 		"deployment_id": deployment.ID,
 		"status":        deployment.Status,
 	})
+}
+
+// DeploymentLogs returns a deployment's build and deploy log: every git,
+// docker build and health-check step with its output, so users can see
+// why a deploy failed, not just the one-line error_message.
+// NEW: GET /api/v1/deployments/:id/logs
+func (h *Handler) DeploymentLogs(c *gin.Context) {
+	id := c.Param("id")
+	if _, err := uuid.Parse(id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid deployment ID"})
+		return
+	}
+
+	logText, err := h.store.DeploymentLog(c.Request.Context(), auth.UserID(c), id)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		c.JSON(http.StatusNotFound, gin.H{"error": "Deployment not found"})
+		return
+	case err != nil:
+		_ = c.Error(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read deployment log"})
+		return
+	}
+	plainText(c, logText)
+}
+
+// AppLogs returns the last lines the app's live container printed: what
+// the app itself is doing (crashes, errors, its own request logs).
+// NEW: GET /api/v1/projects/:name/logs?lines=200
+func (h *Handler) AppLogs(c *gin.Context) {
+	name := strings.ToLower(c.Param("name"))
+
+	// Bounded: a huge tail would make Docker read and us send megabytes
+	// for one request.
+	lines := 200
+	if s := c.Query("lines"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 1 || n > 5000 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "lines must be a number from 1 to 5000"})
+			return
+		}
+		lines = n
+	}
+
+	depID, err := h.store.LiveDeploymentID(c.Request.Context(), auth.UserID(c), name)
+	switch {
+	case errors.Is(err, store.ErrAppNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "No project named " + name})
+		return
+	case errors.Is(err, store.ErrAppNotLive):
+		// 409: the app exists but isn't in a state that has runtime logs.
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "This project isn't running, so it has no runtime logs; see its latest deployment's logs at GET /api/v1/deployments/:id/logs",
+		})
+		return
+	case err != nil:
+		_ = c.Error(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read logs"})
+		return
+	}
+
+	out, err := builder.ContainerLogs(c.Request.Context(), depID, lines)
+	if err != nil {
+		_ = c.Error(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read logs"})
+		return
+	}
+	plainText(c, out)
+}
+
+// plainText sends logs as text/plain, not JSON: they read directly in a
+// terminal (curl) and pipe into grep. nosniff stops a browser from ever
+// treating log text that happens to look like HTML as a page.
+func plainText(c *gin.Context, body string) {
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(body))
 }
 
 func (h *Handler) GetDeployment(c *gin.Context) {

@@ -813,3 +813,45 @@ func (s *Store) LiveHostPort(ctx context.Context, appName string) (int, error) {
 	}
 	return *port, nil
 }
+
+// LiveDeploymentID returns the owner's app's live deployment, whose
+// container's output is the app's runtime log. Same shape as
+// LiveHostPort, but scoped to the owner: logs can hold anything the app
+// prints, secrets included, so only the owner may read them.
+func (s *Store) LiveDeploymentID(ctx context.Context, ownerID, appName string) (string, error) {
+	var id *string
+	err := s.pool.QueryRow(ctx, `
+		SELECT d.id::text
+		FROM apps a
+		LEFT JOIN deployments d
+		       ON d.app_id = a.id
+		      AND d.status = 'healthy'
+		WHERE a.name = $1 AND a.owner_id = $2
+	`, appName, ownerID).Scan(&id)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return "", ErrAppNotFound
+	case err != nil:
+		return "", fmt.Errorf("look up live deployment: %w", err)
+	case id == nil:
+		return "", ErrAppNotLive
+	}
+	return *id, nil
+}
+
+// DeploymentLog returns a deployment's build and deploy log, if ownerID
+// owns its app. Another user's deployment gives pgx.ErrNoRows, the same
+// as a missing one, like GetDeploymentByID.
+func (s *Store) DeploymentLog(ctx context.Context, ownerID, id string) (string, error) {
+	var logText string
+	err := s.pool.QueryRow(ctx, `
+		SELECT d.build_log
+		FROM deployments d
+		JOIN apps a ON a.id = d.app_id
+		WHERE d.id = $1 AND a.owner_id = $2
+	`, id, ownerID).Scan(&logText)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("get deployment log: %w", err)
+	}
+	return logText, err
+}

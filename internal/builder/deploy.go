@@ -36,7 +36,7 @@ func (b *Builder) Deploy(ctx context.Context, job store.Job) (err error) {
 
 	// One name per deployment: a retry replaces its own leftover container
 	// instead of starting a second copy next to it.
-	name := "onvice-" + id
+	name := containerName(id)
 	removeContainers(name)
 
 	// Any failure from here on removes the container, so a broken app
@@ -99,6 +99,26 @@ func (b *Builder) Deploy(ctx context.Context, job store.Job) (err error) {
 	// Only now, with the new version live, remove the app's other containers.
 	removeOtherContainers(in.AppID, name)
 	return nil
+}
+
+// containerName is the one place the naming rule lives, so the deployer
+// and the log reader always agree on which container is which.
+func containerName(deploymentID string) string { return "onvice-" + deploymentID }
+
+// ContainerLogs returns the last `lines` lines a deployment's container
+// printed (stdout and stderr together, as the app wrote them), each with
+// Docker's timestamp so users can line errors up with when they happened.
+// NEW: the runtime log behind GET /projects/:name/logs.
+func ContainerLogs(ctx context.Context, deploymentID string, lines int) (string, error) {
+	var discard strings.Builder
+	// 30s cap: this runs inside an API request; a hung Docker daemon must
+	// not hold the request (and the user's terminal) open forever.
+	out, err := run(ctx, 30*time.Second, "", &discard, nil, "docker", "logs",
+		"--timestamps", "--tail", strconv.Itoa(lines), containerName(deploymentID))
+	if err != nil {
+		return "", fmt.Errorf("read container logs: %w", err)
+	}
+	return out, nil
 }
 
 // waitHealthy polls url until it answers with a status below 500.

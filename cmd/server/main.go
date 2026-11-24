@@ -93,6 +93,8 @@ func run() error {
 	v1.POST("/projects", h.TakingInputofRepoandProjectName)
 	v1.POST("/projects/:name/deployments", h.Redeploy)
 	v1.GET("/deployments/:id", h.GetDeployment)
+	v1.GET("/deployments/:id/logs", h.DeploymentLogs)
+	v1.GET("/projects/:name/logs", h.AppLogs)
 
 	server := &http.Server{
 		Addr:    ":8080",

@@ -302,6 +302,11 @@ func (b *Builder) fail(ctx context.Context, deploymentID, step string, cause err
 		return fmt.Errorf("%s interrupted: %w", step, ctx.Err())
 	}
 
+	// CHANGED: end the log with the reason. Without it, the log a user reads
+	// stops at the last command that ran, and the cause is only in
+	// error_message, a different field.
+	logText += fmt.Sprintf("FAILED at %s: %v\n", step, cause)
+
 	saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
