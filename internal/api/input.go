@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AdarshGT33/onvice/internal/auth"
 	"github.com/AdarshGT33/onvice/internal/store"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -40,9 +41,58 @@ type RateLimitError struct {
 
 type Handler struct {
 	store *store.Store
+	// CHANGED: appURL is the public URL pattern, e.g.
+	// "http://{name}.localhost:8000", so responses can tell users where
+	// their app lives. Comes from config: behind TLS or a load balancer the
+	// public URL differs from what the router listens on.
+	appURL string
 }
 
-func NewHandler(s *store.Store) *Handler { return &Handler{store: s} }
+func NewHandler(s *store.Store, appURL string) *Handler {
+	return &Handler{store: s, appURL: appURL}
+}
+
+// url is the app's stable public URL. It is known from the moment the
+// app is created, before anything is deployed: it never changes.
+func (h *Handler) url(name string) string {
+	return strings.ReplaceAll(h.appURL, "{name}", name)
+}
+
+// ListProjects returns the caller's apps with their URL, whether they are
+// live, and what their newest deployment is doing.
+// NEW: GET /api/v1/projects
+func (h *Handler) ListProjects(c *gin.Context) {
+	apps, err := h.store.ListApps(c.Request.Context(), auth.UserID(c))
+	if err != nil {
+		_ = c.Error(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list projects"})
+		return
+	}
+
+	// Always a JSON array, never null, even with no projects: clients can
+	// loop over it without a special case.
+	projects := make([]gin.H, 0, len(apps))
+	for _, a := range apps {
+		p := gin.H{
+			"app_id":     a.ID,
+			"name":       a.Name,
+			"github_url": a.RepoURL,
+			"url":        h.url(a.Name),
+			"live":       a.Live,
+			"created_at": a.CreatedAt,
+		}
+		if a.LatestDeploymentID != nil {
+			p["latest_deployment"] = gin.H{
+				"deployment_id": *a.LatestDeploymentID,
+				"status":        a.LatestStatus,
+				"error_message": a.LatestErrorMessage,
+				"created_at":    a.LatestCreatedAt,
+			}
+		}
+		projects = append(projects, p)
+	}
+	c.JSON(http.StatusOK, gin.H{"projects": projects})
+}
 
 func (e *RateLimitError) Error() string {
 	return fmt.Sprintf("GitHub rate limit reached, try again in %s", e.RetryAfter.Round(time.Second))
@@ -96,6 +146,7 @@ func (h *Handler) TakingInputofRepoandProjectName(c *gin.Context) {
 
 	app, deployment, err := h.store.CreateAppWithDeployment(
 		c.Request.Context(),
+		auth.UserID(c),
 		input.ProjectName,
 		input.GithubURL,
 	)
@@ -119,6 +170,7 @@ func (h *Handler) TakingInputofRepoandProjectName(c *gin.Context) {
 		"app_id":        app.ID,
 		"name":          app.Name,
 		"github_url":    app.RepoURL,
+		"url":           h.url(app.Name),
 		"deployment_id": deployment.ID,
 		"status":        deployment.Status,
 	})
@@ -133,7 +185,7 @@ func (h *Handler) Redeploy(c *gin.Context) {
 	// Lowercase, like at creation: the name is a hostname.
 	name := strings.ToLower(c.Param("name"))
 
-	deployment, err := h.store.CreateDeployment(c.Request.Context(), name)
+	deployment, err := h.store.CreateDeployment(c.Request.Context(), auth.UserID(c), name)
 	switch {
 	case errors.Is(err, store.ErrAppNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": "No project named " + name})
@@ -160,6 +212,7 @@ func (h *Handler) Redeploy(c *gin.Context) {
 		"message":       "Deployment queued",
 		"app_id":        deployment.AppID,
 		"name":          name,
+		"url":           h.url(name),
 		"deployment_id": deployment.ID,
 		"status":        deployment.Status,
 	})
@@ -177,6 +230,7 @@ func (h *Handler) GetDeployment(c *gin.Context) {
 
 	deployment, err := h.store.GetDeploymentByID(
 		c.Request.Context(),
+		auth.UserID(c),
 		id,
 	)
 

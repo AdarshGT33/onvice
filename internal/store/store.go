@@ -69,8 +69,10 @@ type BuildInput struct {
 
 // CreateAppWithDeployment atomically creates an app,
 // its initial deployment, and its build job.
+// CHANGED: takes the owner; the app belongs to whoever created it.
 func (s *Store) CreateAppWithDeployment(
 	ctx context.Context,
+	ownerID string,
 	name string,
 	repoURL string,
 ) (App, Deployment, error) {
@@ -84,10 +86,10 @@ func (s *Store) CreateAppWithDeployment(
 
 	var app App
 	err = tx.QueryRow(ctx, `
-		INSERT INTO apps (name, repo_url)
-		VALUES ($1, $2)
+		INSERT INTO apps (name, repo_url, owner_id)
+		VALUES ($1, $2, $3)
 		RETURNING id, name, repo_url, created_at, updated_at
-	`, name, repoURL).Scan(
+	`, name, repoURL, ownerID).Scan(
 		&app.ID,
 		&app.Name,
 		&app.RepoURL,
@@ -143,6 +145,88 @@ func (s *Store) CreateAppWithDeployment(
 	return app, deployment, nil
 }
 
+// AppSummary is one row of the project list: the app, whether it is
+// serving traffic, and what its newest deployment is doing. Both are
+// needed: a failed redeploy leaves the previous version live.
+type AppSummary struct {
+	ID                 string
+	Name               string
+	RepoURL            string
+	CreatedAt          time.Time
+	Live               bool
+	LatestDeploymentID *string // pointers: NULL if the app has no deployment
+	LatestStatus       *string
+	LatestErrorMessage *string
+	LatestCreatedAt    *time.Time
+}
+
+// ListApps returns the owner's apps, newest first.
+// ponytail: no pagination; add LIMIT/cursor when someone has hundreds of apps.
+func (s *Store) ListApps(ctx context.Context, ownerID string) ([]AppSummary, error) {
+	// LATERAL runs the "newest deployment" subquery once per app, using
+	// deployments_app_id_created_at; EXISTS uses deployments_one_live_per_app.
+	rows, err := s.pool.Query(ctx, `
+		SELECT a.id::text, a.name, a.repo_url, a.created_at,
+		       EXISTS (SELECT 1 FROM deployments h
+		               WHERE h.app_id = a.id AND h.status = 'healthy'),
+		       l.id::text, l.status, l.error_message, l.created_at
+		FROM apps a
+		LEFT JOIN LATERAL (
+			SELECT id, status, error_message, created_at
+			FROM deployments
+			WHERE app_id = a.id
+			ORDER BY created_at DESC
+			LIMIT 1
+		) l ON true
+		WHERE a.owner_id = $1
+		ORDER BY a.created_at DESC
+	`, ownerID)
+	if err != nil {
+		return nil, fmt.Errorf("list apps: %w", err)
+	}
+	apps, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (AppSummary, error) {
+		var a AppSummary
+		err := r.Scan(&a.ID, &a.Name, &a.RepoURL, &a.CreatedAt, &a.Live,
+			&a.LatestDeploymentID, &a.LatestStatus, &a.LatestErrorMessage, &a.LatestCreatedAt)
+		return a, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list apps: %w", err)
+	}
+	return apps, nil
+}
+
+var ErrInvalidToken = errors.New("invalid API key")
+
+// UserIDByTokenHash finds the user an API key belongs to. Runs on every
+// API request; token_hash is UNIQUE, so it's an index lookup.
+func (s *Store) UserIDByTokenHash(ctx context.Context, hash []byte) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `SELECT id::text FROM users WHERE token_hash = $1`, hash).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrInvalidToken
+	}
+	if err != nil {
+		return "", fmt.Errorf("look up API key: %w", err)
+	}
+	return id, nil
+}
+
+// IssueToken creates the user if new, and gives them this key either way.
+// For an existing user that is a rotation: the old key stops working at
+// once, which is what you want for a lost or leaked key.
+func (s *Store) IssueToken(ctx context.Context, email string, hash []byte) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO users (email, token_hash) VALUES ($1, $2)
+		ON CONFLICT (email) DO UPDATE
+		SET token_hash = EXCLUDED.token_hash, updated_at = now()
+	`, email, hash)
+	if err != nil {
+		return fmt.Errorf("issue API key: %w", err)
+	}
+	return nil
+}
+
 // ErrDeploymentInProgress: the app already has a deployment in the pipeline.
 var ErrDeploymentInProgress = errors.New("a deployment of this app is already in progress")
 
@@ -150,21 +234,24 @@ var ErrDeploymentInProgress = errors.New("a deployment of this app is already in
 // build of the latest commit on its branch, then a zero-downtime swap.
 // On ErrDeploymentInProgress it returns the deployment in progress, so
 // the caller can tell the user which one to wait for.
-func (s *Store) CreateDeployment(ctx context.Context, appName string) (Deployment, error) {
+// CHANGED: only the app's owner can redeploy it. Someone else's app looks
+// exactly like a missing one (ErrAppNotFound), so this endpoint can't be
+// used to probe which apps exist or who owns them.
+func (s *Store) CreateDeployment(ctx context.Context, ownerID, appName string) (Deployment, error) {
 	var d Deployment
 	// One statement: the deployment and its build job exist together or
 	// not at all, the same guarantee CreateAppWithDeployment gives.
 	err := s.pool.QueryRow(ctx, `
 		WITH d AS (
 			INSERT INTO deployments (app_id, status)
-			SELECT id, 'queued' FROM apps WHERE name = $1
+			SELECT id, 'queued' FROM apps WHERE name = $1 AND owner_id = $2
 			RETURNING id, app_id, status, created_at, updated_at
 		), j AS (
 			INSERT INTO jobs (deployment_id, kind, status)
 			SELECT id, 'build', 'pending' FROM d
 		)
 		SELECT id, app_id, status, created_at, updated_at FROM d
-	`, appName).Scan(&d.ID, &d.AppID, &d.Status, &d.CreatedAt, &d.UpdatedAt)
+	`, appName, ownerID).Scan(&d.ID, &d.AppID, &d.Status, &d.CreatedAt, &d.UpdatedAt)
 
 	var pgErr *pgconn.PgError
 	switch {
@@ -174,9 +261,9 @@ func (s *Store) CreateDeployment(ctx context.Context, appName string) (Deploymen
 		err = s.pool.QueryRow(ctx, `
 			SELECT d.id, d.app_id, d.status, d.created_at, d.updated_at
 			FROM deployments d JOIN apps a ON a.id = d.app_id
-			WHERE a.name = $1
+			WHERE a.name = $1 AND a.owner_id = $2
 			  AND d.status IN ('queued', 'building', 'built', 'deploying')
-		`, appName).Scan(&d.ID, &d.AppID, &d.Status, &d.CreatedAt, &d.UpdatedAt)
+		`, appName, ownerID).Scan(&d.ID, &d.AppID, &d.Status, &d.CreatedAt, &d.UpdatedAt)
 		if err != nil {
 			// It finished between the two queries; the client can just retry.
 			return Deployment{}, ErrDeploymentInProgress
@@ -188,22 +275,25 @@ func (s *Store) CreateDeployment(ctx context.Context, appName string) (Deploymen
 	return d, nil
 }
 
-// GetDeploymentByID retrieves a deployment by its ID.
+// GetDeploymentByID retrieves a deployment by its ID, if ownerID owns its app.
+// CHANGED: scoped to the owner. Another user's deployment gives ErrNoRows,
+// the same as a missing one: guessing IDs reveals nothing.
 func (s *Store) GetDeploymentByID(
 	ctx context.Context,
+	ownerID string,
 	id string,
 ) (Deployment, error) {
 	var deployment Deployment
 
-	// CHANGED: also selects the build fields.
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, app_id, status,
-		       commit_sha, started_at, failure_step, error_message,
-		       image_tag, port, host_port,
-		       created_at, updated_at
-		FROM deployments
-		WHERE id = $1
-	`, id).Scan(
+		SELECT d.id, d.app_id, d.status,
+		       d.commit_sha, d.started_at, d.failure_step, d.error_message,
+		       d.image_tag, d.port, d.host_port,
+		       d.created_at, d.updated_at
+		FROM deployments d
+		JOIN apps a ON a.id = d.app_id
+		WHERE d.id = $1 AND a.owner_id = $2
+	`, id, ownerID).Scan(
 		&deployment.ID,
 		&deployment.AppID,
 		&deployment.Status,

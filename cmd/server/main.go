@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/AdarshGT33/onvice/internal/api"
+	"github.com/AdarshGT33/onvice/internal/auth"
 	"github.com/AdarshGT33/onvice/internal/builder"
 	"github.com/AdarshGT33/onvice/internal/queue"
 	"github.com/AdarshGT33/onvice/internal/router"
@@ -64,10 +67,29 @@ func run() error {
 
 	// Wire the layers together: pool -> store -> handlers.
 	db := store.New(pool)
-	h := api.NewHandler(db)
+
+	routerAddr := envOr("ROUTER_ADDR", ":8000")
+	appsDomain := envOr("APPS_DOMAIN", "localhost")
+	_, routerPort, err := net.SplitHostPort(routerAddr)
+	if err != nil {
+		return fmt.Errorf("ROUTER_ADDR %q: %w", routerAddr, err)
+	}
+	// NEW: the public URL users are shown. Locally it is what the router
+	// listens on; in production, behind TLS or a load balancer, set
+	// APP_URL_TEMPLATE, e.g. https://{name}.apps.example.com
+	appURL := envOr("APP_URL_TEMPLATE", "http://{name}."+appsDomain+":"+routerPort)
+	if !strings.Contains(appURL, "{name}") {
+		// Fail at startup, not by showing every user the same wrong URL.
+		return fmt.Errorf("APP_URL_TEMPLATE %q must contain {name}", appURL)
+	}
+	h := api.NewHandler(db, appURL)
 
 	r := gin.Default()
-	v1 := r.Group("/api/v1")
+	// NEW: every API route needs an API key. On the whole group, not per
+	// route, so a route added later can't be left open by accident.
+	// The router (app traffic, :8000) stays public: apps are websites.
+	v1 := r.Group("/api/v1", auth.Middleware(db))
+	v1.GET("/projects", h.ListProjects)
 	v1.POST("/projects", h.TakingInputofRepoandProjectName)
 	v1.POST("/projects/:name/deployments", h.Redeploy)
 	v1.GET("/deployments/:id", h.GetDeployment)
@@ -83,8 +105,8 @@ func run() error {
 	// so a visitor to someone's app can never reach /api/v1, and each side
 	// can later get its own TLS, limits and firewall rules.
 	routerServer := &http.Server{
-		Addr:              envOr("ROUTER_ADDR", ":8000"),
-		Handler:           router.New(db, envOr("APPS_DOMAIN", "localhost")),
+		Addr:              routerAddr,
+		Handler:           router.New(db, appsDomain),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	servers := []*http.Server{server, routerServer}
